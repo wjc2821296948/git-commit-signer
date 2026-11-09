@@ -1,0 +1,19 @@
+# Local reports and logs
+reports/
+logs/
+*.log
+
+# Local backups and scratch work
+backups/
+work/
+*.bundle
+
+# PowerShell/editor artifacts
+*.ps1xml
+*.pssc
+.vscode/
+.idea/
+
+# Windows
+Thumbs.db
+Desktop.ini
