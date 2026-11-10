@@ -10,20 +10,15 @@ on:
       - feature/v0.2-signature-audit
 
 jobs:
-  parse:
+  windows-powershell-51:
+    name: Windows PowerShell 5.1 parser
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        shell:
-          - powershell
-          - pwsh
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Parse GCS.ps1
-        shell: ${{ matrix.shell }}
+      - name: Parse GCS.ps1 with Windows PowerShell
+        shell: powershell
         run: |
           $tokens = $null
           $parseErrors = $null
@@ -38,4 +33,29 @@ jobs:
               throw "GCS.ps1 contains PowerShell syntax errors."
           }
 
-          Write-Host "GCS.ps1 parsed successfully."
+          Write-Host "GCS.ps1 parsed successfully with Windows PowerShell."
+
+  powershell-7:
+    name: PowerShell 7 parser
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Parse GCS.ps1 with PowerShell 7
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD 'GCS.ps1'),
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+
+          if ($parseErrors.Count -gt 0) {
+              $parseErrors | Format-List -Force
+              throw "GCS.ps1 contains PowerShell syntax errors."
+          }
+
+          Write-Host "GCS.ps1 parsed successfully with PowerShell 7."
