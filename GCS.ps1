@@ -315,7 +315,18 @@ function Get-RepositoryCommitAudit {
                 }
 
                 if (-not $commitRecords.ContainsKey($sha)) {
-                    $verification = $commit.commit.verification
+                    $verification = $null
+                    if ($null -ne $commit.commit) {
+                        $verification = $commit.commit.verification
+                    }
+                    $verificationReason = ''
+                    $verifiedAt = ''
+                    $signaturePresent = $false
+                    if ($null -ne $verification) {
+                        $verificationReason = [string]$verification.reason
+                        $verifiedAt = [string]$verification.verified_at
+                        $signaturePresent = ($null -ne $verification.signature -and -not [string]::IsNullOrWhiteSpace([string]$verification.signature))
+                    }
                     $parents = @()
                     if ($null -ne $commit.parents) {
                         $parents = @($commit.parents | ForEach-Object { [string]$_.sha })
@@ -350,9 +361,9 @@ function Get-RepositoryCommitAudit {
                         CommitSha = $sha
                         ShortSha = $sha.Substring(0, [Math]::Min(7, $sha.Length))
                         VerificationStatus = (Get-VerificationStatus -Verification $verification)
-                        VerificationReason = [string]$verification.reason
-                        VerifiedAt = [string]$verification.verified_at
-                        SignaturePresent = ($null -ne $verification.signature -and -not [string]::IsNullOrWhiteSpace([string]$verification.signature))
+                        VerificationReason = $verificationReason
+                        VerifiedAt = $verifiedAt
+                        SignaturePresent = $signaturePresent
                         AuthorName = $authorName
                         AuthorEmail = $authorEmail
                         AuthorDate = $authorDate
@@ -433,7 +444,9 @@ function Write-AuditReports {
         [Parameter(Mandatory = $true)][object[]]$Errors,
         [Parameter(Mandatory = $true)][string]$Login,
         [Parameter(Mandatory = $true)][string]$Directory,
-        [Parameter(Mandatory = $true)][int]$RepositoryFailureCount
+        [Parameter(Mandatory = $true)][int]$RepositoryFailureCount,
+        [Parameter(Mandatory = $true)][int]$RepositoryAttemptedCount,
+        [Parameter(Mandatory = $true)][bool]$ScanStoppedEarly
     )
 
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
@@ -482,8 +495,11 @@ function Write-AuditReports {
         GeneratedAt = $timestamp.ToString('o')
         AuthenticatedLogin = $Login
         RepositoryCount = $Repositories.Count
-        RepositoryScannedCount = ($Repositories.Count - $RepositoryFailureCount)
+        RepositoryAttemptedCount = $RepositoryAttemptedCount
+        RepositoryScannedCount = ($RepositoryAttemptedCount - $RepositoryFailureCount)
         RepositoryFailureCount = $RepositoryFailureCount
+        RepositoryNotAttemptedCount = [Math]::Max(0, ($Repositories.Count - $RepositoryAttemptedCount))
+        ScanStoppedEarly = $ScanStoppedEarly
         BranchCount = $Branches.Count
         BranchFailureCount = @($Branches | Where-Object { $_.Status -eq 'Failed' }).Count
         UniqueCommitCount = $Commits.Count
@@ -539,6 +555,7 @@ function Invoke-Audit {
     $allErrors = New-Object System.Collections.Generic.List[object]
     $repositoryFailureCount = 0
     $repositoryIndex = 0
+    $scanStoppedEarly = $false
 
     foreach ($repository in $repositories) {
         $repositoryIndex++
@@ -562,6 +579,7 @@ function Invoke-Audit {
         Write-Host "  branches: $($result.BranchCount); unique commits: $($result.Commits.Count); branch failures: $($result.BranchFailureCount)"
 
         if ($result.RateLimitHit) {
+            $scanStoppedEarly = $true
             $allErrors.Add([pscustomobject]@{
                 Repository = $repository.FullName
                 Branch = ''
@@ -580,6 +598,8 @@ function Invoke-Audit {
         Login = $Login
         Directory = $Directory
         RepositoryFailureCount = $repositoryFailureCount
+        RepositoryAttemptedCount = $repositoryIndex
+        ScanStoppedEarly = $scanStoppedEarly
     }
     $reports = Write-AuditReports @reportParameters
 
