@@ -1,30 +1,37 @@
 # Git Commit Signer (GCS)
 
-**A Windows-first tool for auditing GitHub repositories and, in later versions, safely re-signing unsigned Git commits.**
+**A Windows-first, read-only GitHub repository and commit-signature auditing tool.**
 
 [简体中文](README.zh-CN.md)
 
-> **Current status: V0.1 — read-only repository discovery.**
+> **Development status: V0.2 preview.** The latest stable release is still [v0.1.0](https://github.com/wjc2821296948/git-commit-signer/releases/tag/v0.1.0).
 >
-> This release discovers repositories visible to the authenticated GitHub account and exports JSON/CSV inventory reports. It does **not** inspect commit-signature status yet, rewrite commits, change Git refs, or push anything to GitHub.
+> V0.2 adds branch and commit-signature auditing. It reads GitHub's commit verification result and exports reports. It does **not** rewrite commits, change Git refs, update repository settings, or push anything.
 
-## Goals
+## Features
 
-- Scan repositories visible to the authenticated GitHub account, not just repositories already cloned on the current computer.
-- Distinguish owned repositories, forks, collaborator/organization repositories, and archived repositories.
-- Keep already-verified commits untouched in future rewrite workflows.
-- Re-sign only unsigned commits where identity and repository permissions are suitable.
-- Preserve merge topology when rewriting is enabled in a later release.
-- Create local recovery backups and require explicit confirmation before every remote branch update.
-- Use the user's existing SSH signing key; never upload or transmit a private key.
+- Discover repositories visible to the authenticated GitHub account, including owned, collaborator, and organization-member repositories.
+- Inventory all ordinary branches in each accessible repository.
+- Read every commit reachable from each branch, following GitHub API pagination.
+- Deduplicate the same commit SHA across branches within each repository, while recording all branches containing it.
+- Classify GitHub's commit verification result:
+  - `Verified`: GitHub reports `verified=true`.
+  - `Unsigned`: GitHub reports `reason=unsigned`.
+  - `UnknownKey`: GitHub reports `reason=unknown_key`.
+  - `Invalid`: GitHub reports `reason=invalid`.
+  - `UnverifiedEmail`: GitHub reports `reason=unverified_email`.
+  - `Unverified`: another non-verified reason.
+  - `Unavailable`: the API response does not include verification data.
+- Export branch, commit, error, and summary reports in CSV/JSON.
+- Stop early when GitHub reports API rate limiting and mark the report incomplete.
 
-## V0.1 prerequisites
+## Requirements
 
 - Windows 10/11
 - Windows PowerShell 5.1 or PowerShell 7+
 - Git for Windows
 - GitHub CLI (`gh`)
-- An authenticated GitHub CLI session with permission to list the repositories you want to inventory
+- An authenticated GitHub CLI session with read access to the repositories you want to audit
 
 No Python, Node.js, paid API, or additional service is required.
 
@@ -38,46 +45,44 @@ No Python, Node.js, paid API, or additional service is required.
    gh auth status
    ```
 
-3. Download or clone this repository.
-4. Run the environment check:
+3. Clone or download this repository.
+4. If this PowerShell session blocks local scripts, allow scripts for this window only:
 
    ```powershell
-   .\GCS.ps1 doctor
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    ```
 
-## Publish this project to your GitHub account
+## Commands
 
-On the Windows machine where SSH commit signing is already configured:
+### Repository inventory (V0.1)
 
-1. Extract this archive into a new folder.
-2. Open the folder and double-click `PUBLISH.cmd`.
-3. Confirm the GitHub account shown is `wjc2821296948`, then type `Y`.
-
-The script verifies the GitHub CLI account, `gpg.format=ssh`, `commit.gpgsign=true`, and the configured public signing-key file. It then creates a signed initial commit and uses `gh repo create` to create `wjc2821296948/git-commit-signer` as a **public** repository and push `main`. It aborts if the folder already has a `.git` directory or the checks fail. It never reads or uploads the private SSH key.
-
-The repository creation command uses the official GitHub CLI `gh repo create` workflow. If publication fails after the local commit, the signed commit remains in this folder and can be pushed later after the cause is resolved.
-
-## Scan all accessible repositories
-
-Run in PowerShell from the project directory:
+Lists repositories visible to the authenticated account:
 
 ```powershell
-.\GCS.ps1 scan
+.\GCS.ps1 scan -ExpectedLogin YOUR_GITHUB_LOGIN
 ```
 
-To require a specific GitHub account:
+### Commit-signature audit (V0.2 preview)
+
+Audits all accessible repositories, their branches, and the commits reachable from those branches:
 
 ```powershell
-.\GCS.ps1 scan -ExpectedLogin wjc2821296948
+.\GCS.ps1 audit -ExpectedLogin YOUR_GITHUB_LOGIN
 ```
+
+The command makes read-only GitHub API requests. It does not clone repositories and does not use local Git history.
 
 To choose a report directory:
 
 ```powershell
-.\GCS.ps1 scan -OutputDirectory "$env:USERPROFILE\Documents\GCS-Reports"
+.\GCS.ps1 audit -ExpectedLogin YOUR_GITHUB_LOGIN -OutputDirectory "$env:USERPROFILE\Documents\GCS-Reports"
 ```
 
-The script uses GitHub's authenticated `/user/repos` endpoint with pagination and requests the `owner`, `collaborator`, and `organization_member` affiliations. It does not print or save the authentication token.
+### Environment check
+
+```powershell
+.\GCS.ps1 doctor
+```
 
 ## Reports
 
@@ -87,43 +92,51 @@ By default, reports are written to:
 %LOCALAPPDATA%\GitCommitSigner\reports\
 ```
 
-Files:
+V0.1 inventory files:
 
-- `repositories.json` — complete repository inventory.
-- `scan-report.csv` — spreadsheet-friendly inventory.
-- `summary.json` — counts and scan metadata.
+- `repositories.json` — repository inventory.
+- `scan-report.csv` — spreadsheet-friendly repository inventory.
+- `summary.json` — V0.1 scan counts.
 
-The report marks a repository as eligible for a *future* rewrite only when it is owned by the authenticated account, is not archived, and the API reports push permission. This is metadata only; V0.1 performs no rewrite.
+V0.2 audit files:
 
-## Commands
+- `branch-audit.csv` — repository, branch, head SHA, protection flag, commit count, and branch scan status.
+- `commit-signature-audit.csv` — one row per unique commit SHA per repository, including verification status/reason, author/committer metadata, branch names, and commit URL.
+- `commit-signature-audit.json` — the same commit audit data in JSON.
+- `audit-errors.csv` — repository/branch failures and incomplete-scan reasons.
+- `audit-summary.json` — counts and a `Complete` flag.
 
-| Command | Purpose |
-|---|---|
-| `scan` | Read-only repository discovery and report export |
-| `doctor` | Check PowerShell, Git, GitHub CLI, OpenSSH, authentication, and Git signing configuration |
-| `help` | Show command help |
+A report is complete only when no repository or branch scan errors occurred. If GitHub rate limiting is detected, the audit stops instead of repeatedly calling the API; inspect `audit-errors.csv` and rerun after the limit resets. Do not treat an incomplete report as a full-account result.
 
-## Safety guarantees in V0.1
+The audit deduplicates a commit only within the same repository. The same SHA appearing in a fork or another repository is reported separately because verification is evaluated in that repository context.
 
-- Read-only against GitHub: only GET-style API requests are used.
-- No commits, tags, branches, or refs are changed.
-- No force-push or regular push is performed.
-- No private key is read, copied, or uploaded.
-- Reports contain repository metadata, not GitHub credentials.
+## Read-only and privacy guarantees
+
+- Only GitHub read operations are used by `scan` and `audit`.
+- No commits, tags, branches, refs, or repository settings are modified.
+- No regular push or force-push is performed.
+- The program does not read, copy, or upload SSH private keys.
+- GitHub CLI manages authentication; tokens are not written to reports or printed by GCS.
+- Reports contain repository and commit metadata. Review reports before sharing them, especially when auditing private repositories.
 
 ## Roadmap
 
-- [x] V0.1 — account authentication check, paginated repository discovery, ownership/visibility classification, JSON and CSV reports.
-- [ ] V0.2 — branch inventory and GitHub commit-signature status classification (`verified`, `unsigned`, `unknown_key`, `invalid`, and other reasons).
+- [x] V0.1 — authenticated account check, paginated repository discovery, ownership/visibility classification, JSON and CSV reports.
+- [x] V0.2 preview — branch inventory, paginated commit history, GitHub verification classification, per-repository SHA deduplication, and audit reports.
+- [ ] V0.2 stable — Windows PowerShell 5.1/7 runtime validation across multi-page repositories and representative signature reasons.
 - [ ] V0.3 — commit-graph analysis and rewrite planning, including downstream descendants.
 - [ ] V0.4 — signed commit reconstruction with merge-parent order and topology preservation.
 - [ ] V0.5 — local bundle backups, recovery metadata, and dry-run review.
 - [ ] V0.6 — per-branch manual push confirmation with an exact expected remote SHA (lease).
 - [ ] V0.7 — post-push GitHub API verification and machine-readable audit report.
 
-## Important limitations planned for later versions
+## Known limitations
 
-Rewriting a commit changes its SHA. Descendants whose parent SHA changes must also be recreated and re-signed, even if they were previously verified. Merge commits require preserving their complete ordered parent list and tree. Commits authored by other people must not be silently recreated as the current user. Protected branches, open pull requests, annotated tags, special commit headers, and remote updates require additional safeguards. These are not handled by V0.1.
+- V0.2 audits ordinary branch refs only. Tags, pull-request refs, and other Git refs are not scanned.
+- It reads the commit history reachable from each branch. Shared commits are deduplicated within a repository, but each branch history is requested separately; large repositories with many branches may take time and consume GitHub API quota.
+- A GitHub API permission error, repository removal, or rate limit can make the report incomplete. The error report must be checked.
+- Verification is GitHub's reported status, not a local cryptographic re-verification using an SSH allowed-signers file.
+- V0.2 is audit-only. It does not perform any signing or history rewriting.
 
 ## License
 
