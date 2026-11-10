@@ -70,30 +70,38 @@ function Invoke-Gh {
 function Get-GhPagedJson {
     param([Parameter(Mandatory = $true)][string[]]$Arguments)
 
+    # Ask gh to paginate normally, but let jq encode each repository record as
+    # one Base64 line. This avoids parsing one large nested JSON document with
+    # Windows PowerShell 5.1's legacy JavaScriptSerializer implementation.
     $result = Invoke-Gh -Arguments $Arguments
-    $jsonText = ($result.Output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-
-    if ([string]::IsNullOrWhiteSpace($jsonText)) {
-        return @()
-    }
-
-    try {
-        $pages = ConvertFrom-Json -InputObject $jsonText
-    }
-    catch {
-        throw "Could not parse paginated GitHub CLI JSON output. Details: $($_.Exception.Message)"
-    }
-
     $items = New-Object System.Collections.Generic.List[object]
-    foreach ($page in @($pages)) {
-        if ($page -is [System.Array]) {
-            foreach ($item in $page) {
-                $items.Add($item)
-            }
+    $recordNumber = 0
+
+    foreach ($line in @($result.Output)) {
+        $encoded = ([string]$line).Trim()
+        if ([string]::IsNullOrWhiteSpace($encoded)) {
+            continue
         }
-        elseif ($null -ne $page) {
-            $items.Add($page)
+
+        if ($encoded -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
+            throw "GitHub CLI returned an unexpected paginated record at position $($recordNumber + 1). The response was not treated as repository data."
         }
+
+        try {
+            $bytes = [Convert]::FromBase64String($encoded)
+            $jsonText = [System.Text.Encoding]::UTF8.GetString($bytes)
+            $item = ConvertFrom-Json -InputObject $jsonText -ErrorAction Stop
+        }
+        catch {
+            throw "Could not decode GitHub repository record $($recordNumber + 1). Details: $($_.Exception.Message)"
+        }
+
+        if ($null -eq $item -or [string]::IsNullOrWhiteSpace([string]$item.full_name)) {
+            throw "GitHub returned an empty or invalid repository record at position $($recordNumber + 1)."
+        }
+
+        $items.Add($item)
+        $recordNumber++
     }
 
     return $items.ToArray()
@@ -118,7 +126,8 @@ function Get-RepositoryInventory {
     $rawRepositories = Get-GhPagedJson -Arguments @(
         'api',
         '--paginate',
-        '--slurp',
+        '--jq',
+        '.[] | @base64',
         $endpoint
     )
 
