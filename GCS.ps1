@@ -22,8 +22,77 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 $script:RequestTimeoutSeconds = $RequestTimeoutSeconds
 $script:MaxRetries = $MaxRetries
-$script:AuditCancelState = $null
+# Use a native Windows console control handler. It runs outside the PowerShell
+# runspace and intercepts Ctrl+C before the PowerShell host stops the pipeline.
+if ($null -eq ('GcsV021ConsoleCancellation' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Threading;
 
+public static class GcsV021ConsoleCancellation
+{
+    private enum ControlType : uint
+    {
+        CtrlC = 0,
+        CtrlBreak = 1
+    }
+
+    private delegate bool ConsoleControlHandler(ControlType controlType);
+
+    private static ConsoleControlHandler _handler;
+    private static int _requested;
+
+    [DllImport("Kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetConsoleCtrlHandler(ConsoleControlHandler handler, bool add);
+
+    public static bool Requested
+    {
+        get { return Volatile.Read(ref _requested) != 0; }
+    }
+
+    public static bool Register()
+    {
+        Interlocked.Exchange(ref _requested, 0);
+
+        if (_handler != null)
+        {
+            return true;
+        }
+
+        _handler = HandleConsoleControl;
+        if (!SetConsoleCtrlHandler(_handler, true))
+        {
+            _handler = null;
+            return false;
+        }
+
+        return true;
+    }
+
+    public static void Unregister()
+    {
+        if (_handler != null)
+        {
+            SetConsoleCtrlHandler(_handler, false);
+            _handler = null;
+        }
+    }
+
+    private static bool HandleConsoleControl(ControlType controlType)
+    {
+        if (controlType == ControlType.CtrlC || controlType == ControlType.CtrlBreak)
+        {
+            Interlocked.Exchange(ref _requested, 1);
+            return true;
+        }
+
+        return false;
+    }
+}
+'@ -ErrorAction Stop | Out-Null
+}
 function Write-Info {
     param([string]$Message)
     Write-Host "[INFO] $Message" -ForegroundColor Cyan
@@ -68,7 +137,7 @@ function Invoke-Gh {
     )
 
     for ($attempt = 1; $attempt -le ($RetryCount + 1); $attempt++) {
-        if ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested) {
+        if ([GcsV021ConsoleCancellation]::Requested) {
             throw [System.OperationCanceledException]::new('Audit cancelled by Ctrl+C.')
         }
 
@@ -88,7 +157,7 @@ function Invoke-Gh {
 
             $timer = [System.Diagnostics.Stopwatch]::StartNew()
             while (-not $process.WaitForExit(250)) {
-                if ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested) {
+                if ([GcsV021ConsoleCancellation]::Requested) {
                     try {
                         $process.Kill()
                         $null = $process.WaitForExit(5000)
@@ -112,6 +181,9 @@ function Invoke-Gh {
             }
 
             $null = $process.WaitForExit()
+            if ([GcsV021ConsoleCancellation]::Requested) {
+                throw [System.OperationCanceledException]::new('Audit cancelled by Ctrl+C.')
+            }
             $exitCode = $process.ExitCode
             $output = @()
             $errorText = ''
@@ -180,7 +252,7 @@ function Get-GhPagedJson {
     $separator = if ($Endpoint.Contains('?')) { '&' } else { '?' }
 
     while ($true) {
-        if ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested) {
+        if ([GcsV021ConsoleCancellation]::Requested) {
             throw [System.OperationCanceledException]::new('Audit cancelled by Ctrl+C.')
         }
 
@@ -368,7 +440,7 @@ function Get-RepositoryCommitAudit {
     catch {
         $message = [string]$_.Exception.Message
         $rateLimitHit = ($message -match '(?i)rate limit|secondary rate|abuse detection')
-        $scanInterrupted = ($_.Exception -is [System.OperationCanceledException])
+        $scanInterrupted = ($_.Exception -is [System.OperationCanceledException]) -or [GcsV021ConsoleCancellation]::Requested
         $errorRows.Add([pscustomobject]@{
             Repository = $Repository.FullName
             Branch = ''
@@ -494,7 +566,7 @@ function Get-RepositoryCommitAudit {
         catch {
             $branchFailureCount++
             $message = [string]$_.Exception.Message
-            $wasCancelled = ($_.Exception -is [System.OperationCanceledException])
+            $wasCancelled = ($_.Exception -is [System.OperationCanceledException]) -or [GcsV021ConsoleCancellation]::Requested
             if ($wasCancelled) {
                 $branchRow.Status = 'Interrupted'
                 $scanInterrupted = $true
@@ -749,7 +821,7 @@ function Invoke-Audit {
         }
     }
 
-    $wasCancelled = ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested)
+    $wasCancelled = [GcsV021ConsoleCancellation]::Requested
     $reportParameters = @{
         Repositories = $repositories
         Branches = @($allBranches.ToArray())
@@ -882,6 +954,22 @@ function Invoke-Doctor {
     [pscustomobject]@{ Component = 'GitHub CLI'; Status = $(if ($ghPath) { 'Found' } else { 'Missing' }); Path = $ghPath }
     [pscustomobject]@{ Component = 'OpenSSH'; Status = $(if ($sshPath) { 'Found' } else { 'Missing' }); Path = $sshPath }
 
+    $cancelHandlerReady = $false
+    try {
+        $cancelHandlerReady = [GcsV021ConsoleCancellation]::Register()
+        if ($cancelHandlerReady) {
+            Write-Host 'Console cancellation handler: Ready' -ForegroundColor Green
+        }
+        else {
+            Write-Warn 'Console cancellation handler: Unavailable (no usable Windows console).'
+        }
+    }
+    finally {
+        if ($cancelHandlerReady) {
+            [GcsV021ConsoleCancellation]::Unregister()
+        }
+    }
+
     if ($ghPath) {
         $script:GhPath = $ghPath
         $auth = Invoke-Gh -Arguments @('auth', 'status') -AllowFailure
@@ -967,26 +1055,18 @@ try {
                 throw "Authenticated account is '$login', but -ExpectedLogin requires '$ExpectedLogin'. Aborting."
             }
 
-            $cancelState = [hashtable]::Synchronized(@{ Requested = $false })
-            $script:AuditCancelState = $cancelState
-            $cancelHandlerScript = {
-                param($sender, $eventArgs)
-                $eventArgs.Cancel = $true
-                $cancelState.Requested = $true
-            }.GetNewClosure()
-            $cancelHandler = [System.ConsoleCancelEventHandler]$cancelHandlerScript
             $cancelHandlerRegistered = $false
-
             try {
-                [System.Console]::add_CancelKeyPress($cancelHandler)
-                $cancelHandlerRegistered = $true
+                $cancelHandlerRegistered = [GcsV021ConsoleCancellation]::Register()
+                if (-not $cancelHandlerRegistered) {
+                    Write-Warn 'Native Ctrl+C handling is unavailable in this console; graceful cancellation may not be possible.'
+                }
                 $auditExitCode = Invoke-Audit -Login $login -Directory $OutputDirectory -Repository $Repository
             }
             finally {
                 if ($cancelHandlerRegistered) {
-                    [System.Console]::remove_CancelKeyPress($cancelHandler)
+                    [GcsV021ConsoleCancellation]::Unregister()
                 }
-                $script:AuditCancelState = $null
             }
 
             exit $auditExitCode

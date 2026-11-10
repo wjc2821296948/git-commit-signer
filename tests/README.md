@@ -27,7 +27,7 @@ V0.2.1 is a read-only reliability update. Test with Windows PowerShell 5.1 and P
 14. Confirm progress is printed before each API request and after each returned page, including multi-page commit histories.
 15. Simulate a slow or hung `gh.exe` request; it must be terminated at `-RequestTimeoutSeconds`, with only the configured number of transient retries.
 16. Confirm API rate-limit and permission failures are not retried indefinitely and are recorded as errors.
-17. Press Ctrl+C during branch listing and during commit pagination; GCS should stop the active `gh.exe`, write reports for completed work, record `Cancelled=true`, and set `Complete=false`.
+17. Press Ctrl+C during branch listing and during commit pagination; the native Windows console-control handler must signal the PowerShell loop, GCS should stop the active `gh.exe`, write reports for completed work, record `Cancelled=true`, and set `Complete=false`.
 18. Confirm a cancelled/incomplete report is never described as a complete full-account audit.
 
 ## Release gate

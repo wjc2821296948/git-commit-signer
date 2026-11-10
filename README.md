@@ -27,7 +27,7 @@
 - Restrict an audit to one repository with `-Repository owner/name`.
 - Show progress for every repository, branch, and API page.
 - Apply a per-request timeout and bounded retries for transient network/server failures.
-- Handle Ctrl+C by stopping the active `gh.exe` request and saving completed results as an incomplete report.
+- Handle Ctrl+C with a native Windows console-control handler that signals the PowerShell audit loop, stops the active `gh.exe` request, and saves completed results as an incomplete report.
 
 ## Requirements
 
