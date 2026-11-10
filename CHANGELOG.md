@@ -15,6 +15,7 @@
 - Replace unbounded `gh api --paginate` waits with individually paged requests that have a per-request timeout.
 - Retry transient network and server failures only a bounded number of times; do not retry rate-limit responses.
 - Handle Ctrl+C by stopping the active `gh.exe` process and saving completed repository/branch results as an incomplete report.
+- Use a native Windows console-control handler to receive Ctrl+C outside the PowerShell runspace and signal the audit loop safely.
 
 ## [0.1.0] - 2026-11-09
 
