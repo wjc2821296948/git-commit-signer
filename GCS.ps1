@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('scan', 'doctor', 'help')]
+    [ValidateSet('scan', 'audit', 'doctor', 'help')]
     [string]$Command = 'scan',
 
     [string]$ExpectedLogin,
@@ -68,11 +68,13 @@ function Invoke-Gh {
 }
 
 function Get-GhPagedJson {
-    param([Parameter(Mandatory = $true)][string[]]$Arguments)
+    param(
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [string]$ExpectedProperty
+    )
 
-    # Ask gh to paginate normally, but let jq encode each repository record as
-    # one Base64 line. This avoids parsing one large nested JSON document with
-    # Windows PowerShell 5.1's legacy JavaScriptSerializer implementation.
+    # gh + jq emits one Base64-encoded JSON object per line. Decode records
+    # individually to avoid large nested JSON parsing failures in PowerShell 5.1.
     $result = Invoke-Gh -Arguments $Arguments
     $items = New-Object System.Collections.Generic.List[object]
     $recordNumber = 0
@@ -84,7 +86,7 @@ function Get-GhPagedJson {
         }
 
         if ($encoded -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
-            throw "GitHub CLI returned an unexpected paginated record at position $($recordNumber + 1). The response was not treated as repository data."
+            throw "GitHub CLI returned an unexpected paginated record at position $($recordNumber + 1)."
         }
 
         try {
@@ -93,11 +95,18 @@ function Get-GhPagedJson {
             $item = ConvertFrom-Json -InputObject $jsonText -ErrorAction Stop
         }
         catch {
-            throw "Could not decode GitHub repository record $($recordNumber + 1). Details: $($_.Exception.Message)"
+            throw "Could not decode GitHub API record $($recordNumber + 1). Details: $($_.Exception.Message)"
         }
 
-        if ($null -eq $item -or [string]::IsNullOrWhiteSpace([string]$item.full_name)) {
-            throw "GitHub returned an empty or invalid repository record at position $($recordNumber + 1)."
+        if ($null -eq $item) {
+            throw "GitHub returned an empty record at position $($recordNumber + 1)."
+        }
+
+        if ($ExpectedProperty) {
+            $property = $item.PSObject.Properties[$ExpectedProperty]
+            if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                throw "GitHub API record $($recordNumber + 1) is missing '$ExpectedProperty'."
+            }
         }
 
         $items.Add($item)
@@ -129,7 +138,7 @@ function Get-RepositoryInventory {
         '--jq',
         '.[] | @base64',
         $endpoint
-    )
+    ) -ExpectedProperty 'full_name'
 
     $seen = @{}
     $inventory = New-Object System.Collections.Generic.List[object]
@@ -205,6 +214,379 @@ function Get-RepositoryInventory {
     }
 
     return @($inventory | Sort-Object FullName)
+}
+
+
+function Get-VerificationStatus {
+    param([object]$Verification)
+
+    if ($null -eq $Verification) {
+        return 'Unavailable'
+    }
+
+    if ($Verification.verified -eq $true) {
+        return 'Verified'
+    }
+
+    switch ([string]$Verification.reason) {
+        'unsigned' { return 'Unsigned' }
+        'unknown_key' { return 'UnknownKey' }
+        'invalid' { return 'Invalid' }
+        'unverified_email' { return 'UnverifiedEmail' }
+        default { return 'Unverified' }
+    }
+}
+
+function Get-RepositoryCommitAudit {
+    param([Parameter(Mandatory = $true)][object]$Repository)
+
+    $branchRows = New-Object System.Collections.Generic.List[object]
+    $errorRows = New-Object System.Collections.Generic.List[object]
+    $commitRecords = @{}
+    $branchFailureCount = 0
+    $branches = @()
+
+    $branchesEndpoint = "/repos/$($Repository.FullName)/branches?per_page=100"
+    try {
+        $branches = @(Get-GhPagedJson -Arguments @(
+            'api',
+            '--paginate',
+            '--jq',
+            '.[] | @base64',
+            $branchesEndpoint
+        ) -ExpectedProperty 'name')
+    }
+    catch {
+        $errorRows.Add([pscustomobject]@{
+            Repository = $Repository.FullName
+            Branch = ''
+            Stage = 'ListBranches'
+            Message = ([string]$_.Exception.Message)
+        })
+        return [pscustomobject]@{
+            Branches = @()
+            Commits = @()
+            Errors = @($errorRows.ToArray())
+            BranchCount = 0
+            BranchFailureCount = 1
+            RepositoryFailed = $true
+        }
+    }
+
+    foreach ($branch in $branches) {
+        $branchName = [string]$branch.name
+        $branchHead = ''
+        if ($null -ne $branch.commit) {
+            $branchHead = [string]$branch.commit.sha
+        }
+
+        $branchRow = [pscustomobject]@{
+            Repository = $Repository.FullName
+            Branch = $branchName
+            HeadSha = $branchHead
+            Protected = [bool]$branch.protected
+            CommitCount = 0
+            Status = 'Pending'
+        }
+        $branchRows.Add($branchRow)
+
+        try {
+            $encodedRef = [Uri]::EscapeDataString($branchName)
+            $commitsEndpoint = "/repos/$($Repository.FullName)/commits?sha=$encodedRef&per_page=100"
+            $branchCommits = @(Get-GhPagedJson -Arguments @(
+                'api',
+                '--paginate',
+                '--jq',
+                '.[] | @base64',
+                $commitsEndpoint
+            ) -ExpectedProperty 'sha')
+
+            $branchRow.CommitCount = $branchCommits.Count
+            $branchRow.Status = 'Scanned'
+
+            foreach ($commit in $branchCommits) {
+                $sha = [string]$commit.sha
+                if ([string]::IsNullOrWhiteSpace($sha)) {
+                    continue
+                }
+
+                if (-not $commitRecords.ContainsKey($sha)) {
+                    $verification = $commit.commit.verification
+                    $parents = @()
+                    if ($null -ne $commit.parents) {
+                        $parents = @($commit.parents | ForEach-Object { [string]$_.sha })
+                    }
+
+                    $author = $commit.commit.author
+                    $committer = $commit.commit.committer
+                    $authorName = ''
+                    $authorEmail = ''
+                    $authorDate = ''
+                    $committerName = ''
+                    $committerEmail = ''
+                    $committerDate = ''
+                    $message = ''
+                    if ($null -ne $author) {
+                        $authorName = [string]$author.name
+                        $authorEmail = [string]$author.email
+                        $authorDate = [string]$author.date
+                    }
+                    if ($null -ne $committer) {
+                        $committerName = [string]$committer.name
+                        $committerEmail = [string]$committer.email
+                        $committerDate = [string]$committer.date
+                    }
+                    if ($null -ne $commit.commit) {
+                        $message = [string]$commit.commit.message
+                    }
+
+                    $branchNames = New-Object System.Collections.Generic.List[string]
+                    $commitRecords[$sha] = [pscustomobject]@{
+                        Repository = $Repository.FullName
+                        CommitSha = $sha
+                        ShortSha = $sha.Substring(0, [Math]::Min(7, $sha.Length))
+                        VerificationStatus = (Get-VerificationStatus -Verification $verification)
+                        VerificationReason = [string]$verification.reason
+                        VerifiedAt = [string]$verification.verified_at
+                        SignaturePresent = ($null -ne $verification.signature -and -not [string]::IsNullOrWhiteSpace([string]$verification.signature))
+                        AuthorName = $authorName
+                        AuthorEmail = $authorEmail
+                        AuthorDate = $authorDate
+                        CommitterName = $committerName
+                        CommitterEmail = $committerEmail
+                        CommitterDate = $committerDate
+                        ParentCount = $parents.Count
+                        IsMergeCommit = ($parents.Count -gt 1)
+                        Message = $message
+                        HtmlUrl = [string]$commit.html_url
+                        BranchNames = $branchNames
+                    }
+                }
+
+                $record = $commitRecords[$sha]
+                if (-not $record.BranchNames.Contains($branchName)) {
+                    $record.BranchNames.Add($branchName)
+                }
+            }
+        }
+        catch {
+            $branchFailureCount++
+            $branchRow.Status = 'Failed'
+            $errorRows.Add([pscustomobject]@{
+                Repository = $Repository.FullName
+                Branch = $branchName
+                Stage = 'ListCommits'
+                Message = ([string]$_.Exception.Message)
+            })
+        }
+    }
+
+    $commitRows = New-Object System.Collections.Generic.List[object]
+    foreach ($record in $commitRecords.Values) {
+        $commitRows.Add([pscustomobject]@{
+            Repository = $record.Repository
+            CommitSha = $record.CommitSha
+            ShortSha = $record.ShortSha
+            VerificationStatus = $record.VerificationStatus
+            VerificationReason = $record.VerificationReason
+            VerifiedAt = $record.VerifiedAt
+            SignaturePresent = $record.SignaturePresent
+            AuthorName = $record.AuthorName
+            AuthorEmail = $record.AuthorEmail
+            AuthorDate = $record.AuthorDate
+            CommitterName = $record.CommitterName
+            CommitterEmail = $record.CommitterEmail
+            CommitterDate = $record.CommitterDate
+            ParentCount = $record.ParentCount
+            IsMergeCommit = $record.IsMergeCommit
+            Branches = (@($record.BranchNames.ToArray()) -join ';')
+            Message = $record.Message
+            HtmlUrl = $record.HtmlUrl
+        })
+    }
+
+    return [pscustomobject]@{
+        Branches = @($branchRows.ToArray())
+        Commits = @($commitRows.ToArray())
+        Errors = @($errorRows.ToArray())
+        BranchCount = $branchRows.Count
+        BranchFailureCount = $branchFailureCount
+        RepositoryFailed = $false
+    }
+}
+
+function Write-AuditReports {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Repositories,
+        [Parameter(Mandatory = $true)][object[]]$Branches,
+        [Parameter(Mandatory = $true)][object[]]$Commits,
+        [Parameter(Mandatory = $true)][object[]]$Errors,
+        [Parameter(Mandatory = $true)][string]$Login,
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][int]$RepositoryFailureCount
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        New-Item -ItemType Directory -Path $Directory -Force | Out-Null
+    }
+
+    $timestamp = Get-Date
+    $branchesCsv = Join-Path $Directory 'branch-audit.csv'
+    $commitsJson = Join-Path $Directory 'commit-signature-audit.json'
+    $commitsCsv = Join-Path $Directory 'commit-signature-audit.csv'
+    $errorsCsv = Join-Path $Directory 'audit-errors.csv'
+    $summaryPath = Join-Path $Directory 'audit-summary.json'
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+    if ($Branches.Count -gt 0) {
+        $Branches | Sort-Object Repository, Branch |
+            Export-Csv -LiteralPath $branchesCsv -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        'Repository,Branch,HeadSha,Protected,CommitCount,Status' |
+            Set-Content -LiteralPath $branchesCsv -Encoding UTF8
+    }
+
+    if ($Commits.Count -gt 0) {
+        $Commits | Sort-Object Repository, CommitterDate, CommitSha |
+            Export-Csv -LiteralPath $commitsCsv -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        'Repository,CommitSha,ShortSha,VerificationStatus,VerificationReason,VerifiedAt,SignaturePresent,AuthorName,AuthorEmail,AuthorDate,CommitterName,CommitterEmail,CommitterDate,ParentCount,IsMergeCommit,Branches,Message,HtmlUrl' |
+            Set-Content -LiteralPath $commitsCsv -Encoding UTF8
+    }
+
+    $commitJson = ConvertTo-Json -InputObject @($Commits) -Depth 8
+    [System.IO.File]::WriteAllText($commitsJson, $commitJson, $utf8NoBom)
+
+    if ($Errors.Count -gt 0) {
+        $Errors | Export-Csv -LiteralPath $errorsCsv -NoTypeInformation -Encoding UTF8
+    }
+    else {
+        'Repository,Branch,Stage,Message' |
+            Set-Content -LiteralPath $errorsCsv -Encoding UTF8
+    }
+
+    $summary = [pscustomobject]@{
+        SchemaVersion = '0.2'
+        GeneratedAt = $timestamp.ToString('o')
+        AuthenticatedLogin = $Login
+        RepositoryCount = $Repositories.Count
+        RepositoryScannedCount = ($Repositories.Count - $RepositoryFailureCount)
+        RepositoryFailureCount = $RepositoryFailureCount
+        BranchCount = $Branches.Count
+        BranchFailureCount = @($Branches | Where-Object { $_.Status -eq 'Failed' }).Count
+        UniqueCommitCount = $Commits.Count
+        VerifiedCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Verified' }).Count
+        UnsignedCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Unsigned' }).Count
+        UnknownKeyCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'UnknownKey' }).Count
+        InvalidCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Invalid' }).Count
+        UnverifiedEmailCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'UnverifiedEmail' }).Count
+        OtherUnverifiedCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Unverified' }).Count
+        VerificationUnavailableCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Unavailable' }).Count
+        ErrorCount = $Errors.Count
+        Complete = ($Errors.Count -eq 0)
+        ReadOnly = $true
+        Reports = [pscustomobject]@{
+            BranchesCsv = $branchesCsv
+            CommitsCsv = $commitsCsv
+            CommitsJson = $commitsJson
+            ErrorsCsv = $errorsCsv
+        }
+    }
+
+    [System.IO.File]::WriteAllText(
+        $summaryPath,
+        (ConvertTo-Json -InputObject $summary -Depth 8),
+        $utf8NoBom
+    )
+
+    return [pscustomobject]@{
+        SummaryPath = $summaryPath
+        Summary = $summary
+        BranchesCsv = $branchesCsv
+        CommitsCsv = $commitsCsv
+        CommitsJson = $commitsJson
+        ErrorsCsv = $errorsCsv
+    }
+}
+
+function Invoke-Audit {
+    param(
+        [Parameter(Mandatory = $true)][string]$Login,
+        [Parameter(Mandatory = $true)][string]$Directory
+    )
+
+    Write-Host ''
+    Write-Host 'Git Commit Signer - V0.2 Commit Signature Audit' -ForegroundColor White
+    Write-Host 'READ-ONLY: no Git refs, commits, or remote content will be modified.' -ForegroundColor Yellow
+    Write-Host "Authenticated as: $Login" -ForegroundColor Green
+    Write-Host ''
+
+    $repositories = @(Get-RepositoryInventory -Login $Login)
+    $allBranches = New-Object System.Collections.Generic.List[object]
+    $allCommits = New-Object System.Collections.Generic.List[object]
+    $allErrors = New-Object System.Collections.Generic.List[object]
+    $repositoryFailureCount = 0
+    $repositoryIndex = 0
+
+    foreach ($repository in $repositories) {
+        $repositoryIndex++
+        Write-Host "[$repositoryIndex/$($repositories.Count)] $($repository.FullName)" -ForegroundColor Cyan
+
+        $result = Get-RepositoryCommitAudit -Repository $repository
+        if ($result.RepositoryFailed) {
+            $repositoryFailureCount++
+        }
+
+        foreach ($branchRow in @($result.Branches)) {
+            $allBranches.Add($branchRow)
+        }
+        foreach ($commitRow in @($result.Commits)) {
+            $allCommits.Add($commitRow)
+        }
+        foreach ($errorRow in @($result.Errors)) {
+            $allErrors.Add($errorRow)
+        }
+
+        Write-Host "  branches: $($result.BranchCount); unique commits: $($result.Commits.Count); branch failures: $($result.BranchFailureCount)"
+    }
+
+    $reportParameters = @{
+        Repositories = $repositories
+        Branches = @($allBranches.ToArray())
+        Commits = @($allCommits.ToArray())
+        Errors = @($allErrors.ToArray())
+        Login = $Login
+        Directory = $Directory
+        RepositoryFailureCount = $repositoryFailureCount
+    }
+    $reports = Write-AuditReports @reportParameters
+
+    Write-Host ''
+    Write-Host 'Signature audit finished.' -ForegroundColor Green
+    Write-Host "Repositories: $($reports.Summary.RepositoryCount)"
+    Write-Host "Branches:     $($reports.Summary.BranchCount)"
+    Write-Host "Unique commits: $($reports.Summary.UniqueCommitCount)"
+    Write-Host "Verified:     $($reports.Summary.VerifiedCount)" -ForegroundColor Green
+    Write-Host "Unsigned:     $($reports.Summary.UnsignedCount)" -ForegroundColor Yellow
+    Write-Host "Unknown key:  $($reports.Summary.UnknownKeyCount)"
+    Write-Host "Invalid:      $($reports.Summary.InvalidCount)" -ForegroundColor Red
+    Write-Host "Other unverified: $($reports.Summary.UnverifiedEmailCount + $reports.Summary.OtherUnverifiedCount)"
+    Write-Host "Errors:       $($reports.Summary.ErrorCount)"
+    Write-Host ''
+    Write-Host "Branches CSV: $($reports.BranchesCsv)"
+    Write-Host "Commits CSV:  $($reports.CommitsCsv)"
+    Write-Host "Commits JSON: $($reports.CommitsJson)"
+    Write-Host "Errors CSV:   $($reports.ErrorsCsv)"
+    Write-Host "Summary:      $($reports.SummaryPath)"
+
+    if (-not $reports.Summary.Complete) {
+        Write-Warn 'The audit is incomplete. Review audit-errors.csv before treating the counts as final.'
+        return 2
+    }
+
+    return 0
 }
 
 function Write-ScanReports {
@@ -328,7 +710,7 @@ function Invoke-Doctor {
 
 function Show-Help {
     @'
-Git Commit Signer (GCS) - V0.1
+Git Commit Signer (GCS) - V0.2 preview
 
 Usage:
   powershell -NoProfile -ExecutionPolicy Bypass -File .\GCS.ps1 scan
@@ -336,6 +718,7 @@ Usage:
 
 Commands:
   scan    Read-only inventory of repositories visible to the GitHub account.
+  audit   Read-only scan of all accessible repository branches and commit signatures.
   doctor  Check Git, GitHub CLI, OpenSSH, authentication, and signing configuration.
   help    Show this help.
 
@@ -343,7 +726,7 @@ Options:
   -ExpectedLogin <login>       Abort if the authenticated GitHub account differs.
   -OutputDirectory <path>      Report directory (default: %LOCALAPPDATA%\GitCommitSigner\reports).
 
-V0.1 is read-only. It does not inspect commit signatures, rewrite commits, modify refs,
+V0.1 scan and V0.2 audit are read-only. They do not rewrite commits, modify refs,
 change GitHub repository settings, or push to GitHub.
 '@ | Write-Host
 }
@@ -359,6 +742,24 @@ try {
         'help' {
             Show-Help
             exit 0
+        }
+        'audit' {
+            if (-not $script:GhPath) {
+                throw 'GitHub CLI (gh) was not found. Install it or add gh.exe to PATH.'
+            }
+
+            $authStatus = Invoke-Gh -Arguments @('auth', 'status') -AllowFailure
+            if ($authStatus.ExitCode -ne 0) {
+                throw 'GitHub CLI is not authenticated. Run: gh auth login'
+            }
+
+            $login = Get-AuthenticatedLogin
+            if ($ExpectedLogin -and $login -ine $ExpectedLogin) {
+                throw "Authenticated account is '$login', but -ExpectedLogin requires '$ExpectedLogin'. Aborting."
+            }
+
+            $auditExitCode = Invoke-Audit -Login $login -Directory $OutputDirectory
+            exit $auditExitCode
         }
         'doctor' {
             Invoke-Doctor
