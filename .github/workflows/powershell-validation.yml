@@ -35,6 +35,14 @@ jobs:
 
           Write-Host "GCS.ps1 parsed successfully with Windows PowerShell."
 
+      - name: Smoke-test startup and compile cancellation handler
+        shell: powershell
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File ".\GCS.ps1" doctor
+          if ($LASTEXITCODE -ne 0) {
+              throw "GCS.ps1 doctor smoke test failed under Windows PowerShell."
+          }
+
   powershell-7:
     name: PowerShell 7 parser
     runs-on: windows-latest
@@ -59,3 +67,11 @@ jobs:
           }
 
           Write-Host "GCS.ps1 parsed successfully with PowerShell 7."
+
+      - name: Smoke-test startup and compile cancellation handler
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -ExecutionPolicy Bypass -File ".\GCS.ps1" doctor
+          if ($LASTEXITCODE -ne 0) {
+              throw "GCS.ps1 doctor smoke test failed under PowerShell 7."
+          }
