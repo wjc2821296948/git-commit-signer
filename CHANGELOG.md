@@ -2,8 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+- Add a read-only V0.2 audit command that inventories repository branches and all reachable commits.
+- Classify GitHub commit verification states and export branch, commit, error, and summary reports.
+- Deduplicate commit SHAs across branches within each repository.
+- Stop the audit when GitHub API rate limiting is detected and mark partial results incomplete.
+
 ### Fixed
-- Decode paginated repository results one record at a time to avoid large nested JSON parsing failures in Windows PowerShell 5.1.
+- Decode paginated API records one at a time to avoid large nested JSON parsing failures in Windows PowerShell 5.1.
 
 ## [0.1.0] - 2026-11-09
 
