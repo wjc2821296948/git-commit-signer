@@ -1,6 +1,6 @@
 # Test plan
 
-V0.2 is a read-only integration feature. Test with Windows PowerShell 5.1 and PowerShell 7+ where available.
+V0.2.1 is a read-only reliability update. Test with Windows PowerShell 5.1 and PowerShell 7+ where available.
 
 ## V0.1 regression checks
 
@@ -22,7 +22,14 @@ V0.2 is a read-only integration feature. Test with Windows PowerShell 5.1 and Po
 9. Simulate or encounter GitHub API rate limiting; the scan must stop promptly, save partial reports, and set `Complete=false`.
 10. Confirm no GitHub branches, commits, tags, repository settings, or refs are changed.
 11. Confirm no token or private key appears in console output or reports.
+12. Run the audit with `-Repository owner/name`; only that repository's branches and commits should be included in the reports.
+13. Provide a repository name that is not accessible; the command must stop with a clear message before branch or commit scanning.
+14. Confirm progress is printed before each API request and after each returned page, including multi-page commit histories.
+15. Simulate a slow or hung `gh.exe` request; it must be terminated at `-RequestTimeoutSeconds`, with only the configured number of transient retries.
+16. Confirm API rate-limit and permission failures are not retried indefinitely and are recorded as errors.
+17. Press Ctrl+C during branch listing and during commit pagination; GCS should stop the active `gh.exe`, write reports for completed work, record `Cancelled=true`, and set `Complete=false`.
+18. Confirm a cancelled/incomplete report is never described as a complete full-account audit.
 
 ## Release gate
 
-Do not mark V0.2 stable until the audit has been run on Windows PowerShell 5.1 and PowerShell 7+ where available, including repositories with multiple branches and histories spanning more than one API page. Review the error report and verify counts against GitHub for a small sample.
+Do not mark V0.2 stable until the audit has been run on Windows PowerShell 5.1 and PowerShell 7+ where available, including a filtered single-repository run, multiple branches, histories spanning more than one API page, timeout/retry behavior, and Ctrl+C cancellation. Review the error report and verify counts against GitHub for a small sample.

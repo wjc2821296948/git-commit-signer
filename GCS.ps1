@@ -6,11 +6,23 @@ param(
 
     [string]$ExpectedLogin,
 
+    [ValidatePattern('^[^/\s]+/[^/\s]+$')]
+    [string]$Repository,
+
+    [ValidateRange(5, 600)]
+    [int]$RequestTimeoutSeconds = 45,
+
+    [ValidateRange(0, 5)]
+    [int]$MaxRetries = 2,
+
     [string]$OutputDirectory = (Join-Path $env:LOCALAPPDATA 'GitCommitSigner\reports')
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+$script:RequestTimeoutSeconds = $RequestTimeoutSeconds
+$script:MaxRetries = $MaxRetries
+$script:AuditCancelState = $null
 
 function Write-Info {
     param([string]$Message)
@@ -50,67 +62,170 @@ function Resolve-Executable {
 function Invoke-Gh {
     param(
         [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [switch]$AllowFailure
+        [switch]$AllowFailure,
+        [ValidateRange(5, 600)][int]$TimeoutSeconds = $script:RequestTimeoutSeconds,
+        [ValidateRange(0, 5)][int]$RetryCount = $script:MaxRetries
     )
 
-    $output = @(& $script:GhPath @Arguments 2>&1)
-    $exitCode = $LASTEXITCODE
+    for ($attempt = 1; $attempt -le ($RetryCount + 1); $attempt++) {
+        if ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested) {
+            throw [System.OperationCanceledException]::new('Audit cancelled by Ctrl+C.')
+        }
 
-    if ($exitCode -ne 0 -and -not $AllowFailure) {
-        $details = ($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
-        throw "GitHub CLI command failed (exit $exitCode): $details"
+        $stdoutPath = [System.IO.Path]::GetTempFileName()
+        $stderrPath = [System.IO.Path]::GetTempFileName()
+        $process = $null
+
+        try {
+            # Start-Process lets GCS enforce a finite timeout and stop a stuck gh.exe.
+            # Quote every argument because Start-Process joins ArgumentList into one string.
+            $argumentLine = (@($Arguments | ForEach-Object { '"' + ([string]$_).Replace('"', '\"') + '"' }) -join ' ')
+            $process = Start-Process -FilePath $script:GhPath -ArgumentList $argumentLine -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
+
+            $timer = [System.Diagnostics.Stopwatch]::StartNew()
+            while (-not $process.WaitForExit(250)) {
+                if ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested) {
+                    try {
+                        $process.Kill()
+                        $null = $process.WaitForExit(5000)
+                    }
+                    catch {
+                        # The process may have exited between the check and Kill().
+                    }
+                    throw [System.OperationCanceledException]::new('Audit cancelled by Ctrl+C.')
+                }
+
+                if ($timer.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+                    try {
+                        $process.Kill()
+                        $null = $process.WaitForExit(5000)
+                    }
+                    catch {
+                        # Ignore a race where the process exits as the timeout fires.
+                    }
+                    throw [System.TimeoutException]::new("GitHub CLI request exceeded the $TimeoutSeconds-second timeout.")
+                }
+            }
+
+            $null = $process.WaitForExit()
+            $exitCode = $process.ExitCode
+            $output = @()
+            $errorText = ''
+
+            if (Test-Path -LiteralPath $stdoutPath -PathType Leaf) {
+                $output = @(Get-Content -LiteralPath $stdoutPath)
+            }
+            if (Test-Path -LiteralPath $stderrPath -PathType Leaf) {
+                $errorText = [System.IO.File]::ReadAllText($stderrPath).Trim()
+            }
+
+            if ($exitCode -ne 0 -and -not $AllowFailure) {
+                $details = $errorText
+                if ([string]::IsNullOrWhiteSpace($details)) {
+                    $details = ($output | ForEach-Object { [string]$_ }) -join [Environment]::NewLine
+                }
+                throw "GitHub CLI command failed (exit $exitCode): $details"
+            }
+
+            return [pscustomobject]@{
+                ExitCode = $exitCode
+                Output = $output
+            }
+        }
+        catch [System.OperationCanceledException] {
+            throw
+        }
+        catch {
+            $message = [string]$_.Exception.Message
+            if ($message -match '(?i)API rate limit|secondary rate limit|abuse detection') {
+                throw
+            }
+
+            $isTransient = ($_.Exception -is [System.TimeoutException]) -or ($message -match '(?i)HTTP 5\d\d|HTTP 429|timed out|timeout|connection reset|connection refused|temporary failure|unexpected EOF|TLS handshake|no such host|proxyconnect|network is unreachable|server error')
+            if ($AllowFailure -or -not $isTransient -or $attempt -gt $RetryCount) {
+                throw
+            }
+
+            $delaySeconds = [Math]::Min(8, [Math]::Pow(2, ($attempt - 1)))
+            Write-Warn "GitHub request failed; retrying in $delaySeconds second(s) ($attempt/$RetryCount). $message"
+            Start-Sleep -Seconds $delaySeconds
+        }
+        finally {
+            if ($null -ne $process) {
+                $process.Dispose()
+            }
+            Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+        }
     }
 
-    return [pscustomobject]@{
-        ExitCode = $exitCode
-        Output   = $output
-    }
+    throw 'GitHub CLI request failed after all retry attempts.'
 }
 
 function Get-GhPagedJson {
     param(
-        [Parameter(Mandatory = $true)][string[]]$Arguments,
-        [string]$ExpectedProperty
+        [Parameter(Mandatory = $true)][string]$Endpoint,
+        [string]$ExpectedProperty,
+        [string]$ProgressLabel = 'GitHub API',
+        [ValidateRange(1, 100)][int]$PerPage = 100
     )
 
-    # gh + jq emits one Base64-encoded JSON object per line. Decode records
-    # individually to avoid large nested JSON parsing failures in PowerShell 5.1.
-    $result = Invoke-Gh -Arguments $Arguments
+    # Fetch pages individually so progress is visible and every request has a timeout.
     $items = New-Object System.Collections.Generic.List[object]
+    $page = 1
     $recordNumber = 0
+    $separator = if ($Endpoint.Contains('?')) { '&' } else { '?' }
 
-    foreach ($line in @($result.Output)) {
-        $encoded = ([string]$line).Trim()
-        if ([string]::IsNullOrWhiteSpace($encoded)) {
-            continue
+    while ($true) {
+        if ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested) {
+            throw [System.OperationCanceledException]::new('Audit cancelled by Ctrl+C.')
         }
 
-        if ($encoded -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
-            throw "GitHub CLI returned an unexpected paginated record at position $($recordNumber + 1)."
-        }
+        $pageEndpoint = "$Endpoint$separator" + "page=$page"
+        Write-Host "  [API] $ProgressLabel - requesting page $page..." -ForegroundColor DarkGray
+        $result = Invoke-Gh -Arguments @('api', '--jq', '.[] | @base64', $pageEndpoint)
 
-        try {
-            $bytes = [Convert]::FromBase64String($encoded)
-            $jsonText = [System.Text.Encoding]::UTF8.GetString($bytes)
-            $item = ConvertFrom-Json -InputObject $jsonText -ErrorAction Stop
-        }
-        catch {
-            throw "Could not decode GitHub API record $($recordNumber + 1). Details: $($_.Exception.Message)"
-        }
-
-        if ($null -eq $item) {
-            throw "GitHub returned an empty record at position $($recordNumber + 1)."
-        }
-
-        if ($ExpectedProperty) {
-            $property = $item.PSObject.Properties[$ExpectedProperty]
-            if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                throw "GitHub API record $($recordNumber + 1) is missing '$ExpectedProperty'."
+        $pageRecordCount = 0
+        foreach ($line in @($result.Output)) {
+            $encoded = ([string]$line).Trim()
+            if ([string]::IsNullOrWhiteSpace($encoded)) {
+                continue
             }
+
+            if ($encoded -notmatch '^[A-Za-z0-9+/]+={0,2}$') {
+                throw "GitHub CLI returned an unexpected paginated record at position $($recordNumber + 1)."
+            }
+
+            try {
+                $bytes = [Convert]::FromBase64String($encoded)
+                $jsonText = [System.Text.Encoding]::UTF8.GetString($bytes)
+                $item = ConvertFrom-Json -InputObject $jsonText -ErrorAction Stop
+            }
+            catch {
+                throw "Could not decode GitHub API record $($recordNumber + 1). Details: $($_.Exception.Message)"
+            }
+
+            if ($null -eq $item) {
+                throw "GitHub returned an empty record at position $($recordNumber + 1)."
+            }
+
+            if ($ExpectedProperty) {
+                $property = $item.PSObject.Properties[$ExpectedProperty]
+                if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    throw "GitHub API record $($recordNumber + 1) is missing '$ExpectedProperty'."
+                }
+            }
+
+            $items.Add($item)
+            $recordNumber++
+            $pageRecordCount++
         }
 
-        $items.Add($item)
-        $recordNumber++
+        Write-Host "  [API] $ProgressLabel - page $page returned $pageRecordCount record(s)." -ForegroundColor DarkGray
+        if ($pageRecordCount -lt $PerPage) {
+            break
+        }
+
+        $page++
     }
 
     return $items.ToArray()
@@ -132,13 +247,7 @@ function Get-RepositoryInventory {
 
     Write-Info 'Retrieving all repositories visible to the authenticated GitHub account...'
     $endpoint = '/user/repos?per_page=100&affiliation=owner%2Ccollaborator%2Corganization_member&visibility=all&sort=full_name&direction=asc'
-    $rawRepositories = Get-GhPagedJson -Arguments @(
-        'api',
-        '--paginate',
-        '--jq',
-        '.[] | @base64',
-        $endpoint
-    ) -ExpectedProperty 'full_name'
+    $rawRepositories = Get-GhPagedJson -Endpoint $endpoint -ExpectedProperty 'full_name' -ProgressLabel 'Repository inventory'
 
     $seen = @{}
     $inventory = New-Object System.Collections.Generic.List[object]
@@ -245,25 +354,21 @@ function Get-RepositoryCommitAudit {
     $commitRecords = @{}
     $branchFailureCount = 0
     $rateLimitHit = $false
+    $scanInterrupted = $false
     $branches = @()
 
     $branchesEndpoint = "/repos/$($Repository.FullName)/branches?per_page=100"
     try {
-        $branches = @(Get-GhPagedJson -Arguments @(
-            'api',
-            '--paginate',
-            '--jq',
-            '.[] | @base64',
-            $branchesEndpoint
-        ) -ExpectedProperty 'name')
+        $branches = @(Get-GhPagedJson -Endpoint $branchesEndpoint -ExpectedProperty 'name' -ProgressLabel "$($Repository.FullName) branches")
     }
     catch {
         $message = [string]$_.Exception.Message
         $rateLimitHit = ($message -match '(?i)rate limit|secondary rate|abuse detection')
+        $scanInterrupted = ($_.Exception -is [System.OperationCanceledException])
         $errorRows.Add([pscustomobject]@{
             Repository = $Repository.FullName
             Branch = ''
-            Stage = 'ListBranches'
+            Stage = $(if ($scanInterrupted) { 'Cancelled' } else { 'ListBranches' })
             Message = $message
         })
         return [pscustomobject]@{
@@ -274,10 +379,13 @@ function Get-RepositoryCommitAudit {
             BranchFailureCount = 1
             RepositoryFailed = $true
             RateLimitHit = $rateLimitHit
+            Interrupted = $scanInterrupted
         }
     }
 
+    $branchIndex = 0
     foreach ($branch in $branches) {
+        $branchIndex++
         $branchName = [string]$branch.name
         $branchHead = ''
         if ($null -ne $branch.commit) {
@@ -297,13 +405,8 @@ function Get-RepositoryCommitAudit {
         try {
             $encodedRef = [Uri]::EscapeDataString($branchName)
             $commitsEndpoint = "/repos/$($Repository.FullName)/commits?sha=$encodedRef&per_page=100"
-            $branchCommits = @(Get-GhPagedJson -Arguments @(
-                'api',
-                '--paginate',
-                '--jq',
-                '.[] | @base64',
-                $commitsEndpoint
-            ) -ExpectedProperty 'sha')
+            Write-Host "  [Branch $branchIndex/$($branches.Count)] $branchName - reading commit history..." -ForegroundColor Gray
+            $branchCommits = @(Get-GhPagedJson -Endpoint $commitsEndpoint -ExpectedProperty 'sha' -ProgressLabel "$($Repository.FullName) / $branchName")
 
             $branchRow.CommitCount = $branchCommits.Count
             $branchRow.Status = 'Scanned'
@@ -386,16 +489,23 @@ function Get-RepositoryCommitAudit {
         }
         catch {
             $branchFailureCount++
-            $branchRow.Status = 'Failed'
             $message = [string]$_.Exception.Message
+            $wasCancelled = ($_.Exception -is [System.OperationCanceledException])
+            if ($wasCancelled) {
+                $branchRow.Status = 'Interrupted'
+                $scanInterrupted = $true
+            }
+            else {
+                $branchRow.Status = 'Failed'
+            }
             $rateLimitHit = ($message -match '(?i)rate limit|secondary rate|abuse detection')
             $errorRows.Add([pscustomobject]@{
                 Repository = $Repository.FullName
                 Branch = $branchName
-                Stage = 'ListCommits'
+                Stage = $(if ($wasCancelled) { 'Cancelled' } else { 'ListCommits' })
                 Message = $message
             })
-            if ($rateLimitHit) {
+            if ($rateLimitHit -or $wasCancelled) {
                 break
             }
         }
@@ -431,8 +541,9 @@ function Get-RepositoryCommitAudit {
         Errors = @($errorRows.ToArray())
         BranchCount = $branchRows.Count
         BranchFailureCount = $branchFailureCount
-        RepositoryFailed = $false
+        RepositoryFailed = ($branchFailureCount -gt 0)
         RateLimitHit = $rateLimitHit
+        Interrupted = $scanInterrupted
     }
 }
 
@@ -446,7 +557,9 @@ function Write-AuditReports {
         [Parameter(Mandatory = $true)][string]$Directory,
         [Parameter(Mandatory = $true)][int]$RepositoryFailureCount,
         [Parameter(Mandatory = $true)][int]$RepositoryAttemptedCount,
-        [Parameter(Mandatory = $true)][bool]$ScanStoppedEarly
+        [Parameter(Mandatory = $true)][bool]$ScanStoppedEarly,
+        [string]$RepositoryFilter = '',
+        [bool]$Cancelled = $false
     )
 
     if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
@@ -491,8 +604,12 @@ function Write-AuditReports {
     }
 
     $summary = [pscustomobject]@{
-        SchemaVersion = '0.2'
+        SchemaVersion = '0.2.1'
         GeneratedAt = $timestamp.ToString('o')
+        RepositoryFilter = $RepositoryFilter
+        RequestTimeoutSeconds = $script:RequestTimeoutSeconds
+        MaxRetries = $script:MaxRetries
+        Cancelled = $Cancelled
         AuthenticatedLogin = $Login
         RepositoryCount = $Repositories.Count
         RepositoryAttemptedCount = $RepositoryAttemptedCount
@@ -501,7 +618,7 @@ function Write-AuditReports {
         RepositoryNotAttemptedCount = [Math]::Max(0, ($Repositories.Count - $RepositoryAttemptedCount))
         ScanStoppedEarly = $ScanStoppedEarly
         BranchCount = $Branches.Count
-        BranchFailureCount = @($Branches | Where-Object { $_.Status -eq 'Failed' }).Count
+        BranchFailureCount = @($Branches | Where-Object { $_.Status -eq 'Failed' -or $_.Status -eq 'Interrupted' }).Count
         UniqueCommitCount = $Commits.Count
         VerifiedCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Verified' }).Count
         UnsignedCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Unsigned' }).Count
@@ -511,7 +628,7 @@ function Write-AuditReports {
         OtherUnverifiedCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Unverified' }).Count
         VerificationUnavailableCount = @($Commits | Where-Object { $_.VerificationStatus -eq 'Unavailable' }).Count
         ErrorCount = $Errors.Count
-        Complete = ($Errors.Count -eq 0)
+        Complete = ($Errors.Count -eq 0 -and -not $ScanStoppedEarly)
         ReadOnly = $true
         Reports = [pscustomobject]@{
             BranchesCsv = $branchesCsv
@@ -540,56 +657,95 @@ function Write-AuditReports {
 function Invoke-Audit {
     param(
         [Parameter(Mandatory = $true)][string]$Login,
-        [Parameter(Mandatory = $true)][string]$Directory
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [string]$Repository
     )
 
     Write-Host ''
-    Write-Host 'Git Commit Signer - V0.2 Commit Signature Audit' -ForegroundColor White
+    Write-Host 'Git Commit Signer - V0.2.1 Commit Signature Audit' -ForegroundColor White
     Write-Host 'READ-ONLY: no Git refs, commits, or remote content will be modified.' -ForegroundColor Yellow
     Write-Host "Authenticated as: $Login" -ForegroundColor Green
+    Write-Host "Per-request timeout: $($script:RequestTimeoutSeconds)s; retries: $($script:MaxRetries)" -ForegroundColor Gray
+    if ($Repository) {
+        Write-Host "Repository filter: $Repository" -ForegroundColor Cyan
+    }
     Write-Host ''
 
-    $repositories = @(Get-RepositoryInventory -Login $Login)
     $allBranches = New-Object System.Collections.Generic.List[object]
     $allCommits = New-Object System.Collections.Generic.List[object]
     $allErrors = New-Object System.Collections.Generic.List[object]
     $repositoryFailureCount = 0
     $repositoryIndex = 0
     $scanStoppedEarly = $false
+    $repositories = @()
 
-    foreach ($repository in $repositories) {
-        $repositoryIndex++
-        Write-Host "[$repositoryIndex/$($repositories.Count)] $($repository.FullName)" -ForegroundColor Cyan
+    try {
+        $repositories = @(Get-RepositoryInventory -Login $Login)
+    }
+    catch [System.OperationCanceledException] {
+        $scanStoppedEarly = $true
+        $allErrors.Add([pscustomobject]@{
+            Repository = ''
+            Branch = ''
+            Stage = 'Cancelled'
+            Message = 'Audit cancelled while retrieving the repository inventory. No repository scan was completed.'
+        })
+    }
 
-        $result = Get-RepositoryCommitAudit -Repository $repository
-        if ($result.RepositoryFailed) {
-            $repositoryFailureCount++
-        }
-
-        foreach ($branchRow in @($result.Branches)) {
-            $allBranches.Add($branchRow)
-        }
-        foreach ($commitRow in @($result.Commits)) {
-            $allCommits.Add($commitRow)
-        }
-        foreach ($errorRow in @($result.Errors)) {
-            $allErrors.Add($errorRow)
-        }
-
-        Write-Host "  branches: $($result.BranchCount); unique commits: $($result.Commits.Count); branch failures: $($result.BranchFailureCount)"
-
-        if ($result.RateLimitHit) {
-            $scanStoppedEarly = $true
-            $allErrors.Add([pscustomobject]@{
-                Repository = $repository.FullName
-                Branch = ''
-                Stage = 'ScanStopped'
-                Message = 'GitHub API rate limiting was detected. Remaining repositories were not scanned; rerun the audit after the limit resets.'
-            })
-            break
+    if (-not $scanStoppedEarly -and $Repository) {
+        $repositories = @($repositories | Where-Object { $_.FullName -ieq $Repository })
+        if ($repositories.Count -eq 0) {
+            throw "Repository '$Repository' is not visible to the authenticated account '$Login'."
         }
     }
 
+    if (-not $scanStoppedEarly) {
+        foreach ($repositoryItem in $repositories) {
+            $repositoryIndex++
+            Write-Host "[$repositoryIndex/$($repositories.Count)] $($repositoryItem.FullName)" -ForegroundColor Cyan
+
+            $result = Get-RepositoryCommitAudit -Repository $repositoryItem
+            if ($result.RepositoryFailed) {
+                $repositoryFailureCount++
+            }
+
+            foreach ($branchRow in @($result.Branches)) {
+                $allBranches.Add($branchRow)
+            }
+            foreach ($commitRow in @($result.Commits)) {
+                $allCommits.Add($commitRow)
+            }
+            foreach ($errorRow in @($result.Errors)) {
+                $allErrors.Add($errorRow)
+            }
+
+            Write-Host "  branches: $($result.BranchCount); unique commits: $($result.Commits.Count); branch failures: $($result.BranchFailureCount)"
+
+            if ($result.Interrupted) {
+                $scanStoppedEarly = $true
+                $allErrors.Add([pscustomobject]@{
+                    Repository = $repositoryItem.FullName
+                    Branch = ''
+                    Stage = 'ScanStopped'
+                    Message = 'The user cancelled the audit. Completed repository and branch results were saved; the current scan is incomplete.'
+                })
+                break
+            }
+
+            if ($result.RateLimitHit) {
+                $scanStoppedEarly = $true
+                $allErrors.Add([pscustomobject]@{
+                    Repository = $repositoryItem.FullName
+                    Branch = ''
+                    Stage = 'ScanStopped'
+                    Message = 'GitHub API rate limiting was detected. Remaining repositories were not scanned; rerun the audit after the limit resets.'
+                })
+                break
+            }
+        }
+    }
+
+    $wasCancelled = ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested)
     $reportParameters = @{
         Repositories = $repositories
         Branches = @($allBranches.ToArray())
@@ -600,12 +756,16 @@ function Invoke-Audit {
         RepositoryFailureCount = $repositoryFailureCount
         RepositoryAttemptedCount = $repositoryIndex
         ScanStoppedEarly = $scanStoppedEarly
+        RepositoryFilter = $Repository
+        Cancelled = $wasCancelled
     }
     $reports = Write-AuditReports @reportParameters
 
     Write-Host ''
     Write-Host 'Signature audit finished.' -ForegroundColor Green
-    Write-Host "Repositories: $($reports.Summary.RepositoryCount)"
+    Write-Host "Repositories selected: $($reports.Summary.RepositoryCount)"
+    Write-Host "Repositories attempted: $($reports.Summary.RepositoryAttemptedCount)"
+    Write-Host "Repositories not attempted: $($reports.Summary.RepositoryNotAttemptedCount)"
     Write-Host "Branches:     $($reports.Summary.BranchCount)"
     Write-Host "Unique commits: $($reports.Summary.UniqueCommitCount)"
     Write-Host "Verified:     $($reports.Summary.VerifiedCount)" -ForegroundColor Green
@@ -614,6 +774,7 @@ function Invoke-Audit {
     Write-Host "Invalid:      $($reports.Summary.InvalidCount)" -ForegroundColor Red
     Write-Host "Other unverified: $($reports.Summary.UnverifiedEmailCount + $reports.Summary.OtherUnverifiedCount)"
     Write-Host "Errors:       $($reports.Summary.ErrorCount)"
+    Write-Host "Complete:     $($reports.Summary.Complete)"
     Write-Host ''
     Write-Host "Branches CSV: $($reports.BranchesCsv)"
     Write-Host "Commits CSV:  $($reports.CommitsCsv)"
@@ -622,7 +783,7 @@ function Invoke-Audit {
     Write-Host "Summary:      $($reports.SummaryPath)"
 
     if (-not $reports.Summary.Complete) {
-        Write-Warn 'The audit is incomplete. Review audit-errors.csv before treating the counts as final.'
+        Write-Warn 'The audit is incomplete. Completed results were saved; review audit-errors.csv before treating the counts as final.'
         return 2
     }
 
@@ -750,7 +911,7 @@ function Invoke-Doctor {
 
 function Show-Help {
     @'
-Git Commit Signer (GCS) - V0.2 preview
+Git Commit Signer (GCS) - V0.2.1 preview
 
 Usage:
   powershell -NoProfile -ExecutionPolicy Bypass -File .\GCS.ps1 scan
@@ -765,9 +926,12 @@ Commands:
 
 Options:
   -ExpectedLogin <login>       Abort if the authenticated GitHub account differs.
+  -Repository <owner/name>      Audit only one visible repository (audit command).
+  -RequestTimeoutSeconds <n>    Per-request timeout in seconds (default: 45; range: 5-600).
+  -MaxRetries <n>               Retry transient request failures (default: 2; range: 0-5).
   -OutputDirectory <path>      Report directory (default: %LOCALAPPDATA%\GitCommitSigner\reports).
 
-V0.1 scan and V0.2 audit are read-only. They do not rewrite commits, modify refs,
+V0.1 scan and V0.2.1 audit are read-only. They do not rewrite commits, modify refs,
 change GitHub repository settings, or push to GitHub.
 '@ | Write-Host
 }
@@ -799,7 +963,28 @@ try {
                 throw "Authenticated account is '$login', but -ExpectedLogin requires '$ExpectedLogin'. Aborting."
             }
 
-            $auditExitCode = Invoke-Audit -Login $login -Directory $OutputDirectory
+            $cancelState = [hashtable]::Synchronized(@{ Requested = $false })
+            $script:AuditCancelState = $cancelState
+            $cancelHandlerScript = {
+                param($sender, $eventArgs)
+                $eventArgs.Cancel = $true
+                $cancelState.Requested = $true
+            }.GetNewClosure()
+            $cancelHandler = [System.ConsoleCancelEventHandler]$cancelHandlerScript
+            $cancelHandlerRegistered = $false
+
+            try {
+                [System.Console]::add_CancelKeyPress($cancelHandler)
+                $cancelHandlerRegistered = $true
+                $auditExitCode = Invoke-Audit -Login $login -Directory $OutputDirectory -Repository $Repository
+            }
+            finally {
+                if ($cancelHandlerRegistered) {
+                    [System.Console]::remove_CancelKeyPress($cancelHandler)
+                }
+                $script:AuditCancelState = $null
+            }
+
             exit $auditExitCode
         }
         'doctor' {
