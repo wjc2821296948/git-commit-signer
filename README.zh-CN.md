@@ -1,30 +1,37 @@
 # Git Commit Signer（GCS）
 
-**面向 Windows 的 GitHub 仓库扫描工具，后续版本将支持安全地为未签名提交补签。**
+**面向 Windows 的 GitHub 仓库与提交签名只读审计工具。**
 
 [English](README.md)
 
-> **当前版本：V0.1，只读仓库发现。**
+> **开发状态：V0.2 preview。** 当前最新稳定版仍是 [v0.1.0](https://github.com/wjc2821296948/git-commit-signer/releases/tag/v0.1.0)。
 >
-> 本版本从已登录的 GitHub 账号获取可访问仓库清单，并导出 JSON/CSV 报告。当前还不会检查提交签名状态、重写提交、修改 Git 引用或向 GitHub 推送内容。
+> V0.2 增加分支和提交签名审计。程序读取 GitHub 返回的提交验证结果并导出报告。它**不会**重写提交、修改 Git 引用、修改仓库设置，也不会向 GitHub 推送内容。
 
-## 项目目标
+## 功能
 
-- 扫描 GitHub 账号可访问的仓库，而不局限于本机已经克隆的仓库。
-- 区分个人拥有的仓库、Fork、协作/组织仓库和归档仓库。
-- 后续补签时，不重复处理已经 Verified 的提交。
-- 只对身份明确、权限合适的未签名提交进行补签。
-- 后续重写提交时保留 Merge Commit 的父提交顺序和合并拓扑。
-- 操作前创建本地恢复备份；每个远程分支都必须由用户明确确认后才能更新。
-- 复用用户现有 SSH 签名密钥；绝不上传或传输私钥。
+- 获取当前 GitHub 登录账号可访问的仓库，包括个人仓库、协作仓库和组织成员仓库。
+- 获取每个仓库的全部普通分支。
+- 分页读取每个分支可达的全部提交历史。
+- 在同一个仓库内按 Commit SHA 去重，并记录该提交出现在哪些分支。
+- 根据 GitHub 的提交验证结果分类：
+  - `Verified`：GitHub 返回 `verified=true`。
+  - `Unsigned`：GitHub 返回 `reason=unsigned`。
+  - `UnknownKey`：GitHub 返回 `reason=unknown_key`。
+  - `Invalid`：GitHub 返回 `reason=invalid`。
+  - `UnverifiedEmail`：GitHub 返回 `reason=unverified_email`。
+  - `Unverified`：其他未验证原因。
+  - `Unavailable`：API 响应未提供验证信息。
+- 导出分支、提交、错误和统计报告，支持 CSV/JSON。
+- 检测到 GitHub API 限流时提前停止，并将报告标记为不完整。
 
-## V0.1 环境要求
+## 环境要求
 
 - Windows 10/11
 - Windows PowerShell 5.1 或 PowerShell 7+
 - Git for Windows
 - GitHub CLI（`gh`）
-- 已登录 GitHub CLI，且账号具有所需仓库的读取权限
+- 已登录 GitHub CLI，且对需要审计的仓库具有读取权限
 
 不需要 Python、Node.js、付费 API 或额外服务。
 
@@ -38,90 +45,98 @@
    gh auth status
    ```
 
-3. 下载或克隆本仓库。
-4. 运行环境检查：
+3. 克隆或下载本仓库。
+4. 如果当前 PowerShell 窗口禁止运行本地脚本，只对当前窗口临时放行：
 
    ```powershell
-   .\GCS.ps1 doctor
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
    ```
 
-## 发布到你的 GitHub 账号
+## 命令
 
-在已经配置 SSH Commit Signing 的 Windows 电脑上操作：
+### 仓库清单扫描（V0.1）
 
-1. 将压缩包解压到一个新文件夹。
-2. 打开文件夹，双击 `PUBLISH.cmd`。
-3. 确认显示的 GitHub 账号是 `wjc2821296948`，然后输入 `Y`。
-
-脚本会先检查 GitHub CLI 登录账号、`gpg.format=ssh`、`commit.gpgsign=true` 和已配置的公钥文件。检查通过后，它会创建一个带 SSH 签名的初始提交，再通过 `gh repo create` 创建公开仓库 `wjc2821296948/git-commit-signer` 并推送 `main`。如果目录已有 `.git`、账号不匹配或签名配置不正确，脚本会停止。脚本不会读取或上传 SSH 私钥。
-
-如果创建仓库或推送失败，已经创建的本地签名提交会保留在当前文件夹中，可以排除故障后再推送。
-
-## 扫描全部可访问仓库
-
-在 PowerShell 中进入项目目录，然后执行：
+列出当前 GitHub 账号可访问的仓库：
 
 ```powershell
-.\GCS.ps1 scan
+.\GCS.ps1 scan -ExpectedLogin YOUR_GITHUB_LOGIN
 ```
 
-要求登录账号必须是指定用户：
+### 提交签名审计（V0.2 preview）
+
+扫描所有可访问仓库、它们的分支，以及各分支可达的提交：
 
 ```powershell
-.\GCS.ps1 scan -ExpectedLogin wjc2821296948
+.\GCS.ps1 audit -ExpectedLogin YOUR_GITHUB_LOGIN
 ```
+
+该命令只执行 GitHub 读取请求，不会克隆仓库，也不会读取本机 Git 历史。
 
 自定义报告目录：
 
 ```powershell
-.\GCS.ps1 scan -OutputDirectory "$env:USERPROFILE\Documents\GCS-Reports"
+.\GCS.ps1 audit -ExpectedLogin YOUR_GITHUB_LOGIN -OutputDirectory "$env:USERPROFILE\Documents\GCS-Reports"
 ```
 
-脚本使用 GitHub 已认证的 `/user/repos` 接口，并启用分页及 `owner`、`collaborator`、`organization_member` 关联范围。脚本不会输出或保存 GitHub Token。
+### 环境检查
+
+```powershell
+.\GCS.ps1 doctor
+```
 
 ## 报告文件
 
-默认输出到：
+默认保存到：
 
 ```text
 %LOCALAPPDATA%\GitCommitSigner\reports\
 ```
 
-- `repositories.json`：完整仓库清单。
+V0.1 仓库清单文件：
+
+- `repositories.json`：仓库清单。
 - `scan-report.csv`：适合电子表格查看的仓库清单。
-- `summary.json`：扫描统计和元数据。
+- `summary.json`：V0.1 扫描统计。
 
-只有当仓库属于当前登录账号、未归档且 API 返回可推送权限时，才会标记为“未来可进入改写流程”。这只是权限元数据判断；V0.1 不会执行任何改写。
+V0.2 签名审计文件：
 
-## 命令
+- `branch-audit.csv`：仓库、分支、分支头 SHA、保护状态、提交数量和扫描状态。
+- `commit-signature-audit.csv`：每个仓库内每条唯一提交一行，包含验证状态/原因、作者/提交者信息、所属分支和提交链接。
+- `commit-signature-audit.json`：同一份提交审计数据的 JSON 格式。
+- `audit-errors.csv`：仓库/分支读取失败及扫描不完整原因。
+- `audit-summary.json`：统计数量和 `Complete` 完整性标记。
 
-| 命令 | 作用 |
-|---|---|
-| `scan` | 只读扫描仓库并导出报告 |
-| `doctor` | 检查 PowerShell、Git、GitHub CLI、OpenSSH、登录状态和 Git 签名配置 |
-| `help` | 显示帮助 |
+只有在没有仓库或分支扫描错误时，报告才会标记为完整。如果检测到 GitHub API 限流，程序会停止继续请求；请检查 `audit-errors.csv`，待限流解除后重新运行。**不完整报告不能作为全账号扫描结果使用。**
 
-## V0.1 安全保证
+相同 Commit SHA 只在同一个仓库内去重。如果同一提交同时出现在 Fork 或另一个仓库中，会分别记录，因为 GitHub 的验证结果是在对应仓库上下文中读取的。
 
-- 对 GitHub 只执行读取操作。
-- 不修改提交、Tag、分支或任何 Git 引用。
+## 只读与隐私保证
+
+- `scan` 和 `audit` 只使用 GitHub 读取接口。
+- 不修改提交、Tag、分支、Git 引用或仓库设置。
 - 不执行普通推送或强制推送。
 - 不读取、复制或上传 SSH 私钥。
-- 报告只包含仓库元数据，不包含 GitHub 凭据。
+- GitHub CLI 管理登录凭据；GCS 不会把 Token 写入报告或打印出来。
+- 报告包含仓库和提交元数据。分享报告前请检查内容，特别是审计私有仓库时。
 
 ## 开发路线图
 
 - [x] V0.1：账号认证检查、分页获取仓库、所有权/可见性分类、JSON/CSV 报告。
-- [ ] V0.2：分支清单和 GitHub 提交签名状态分类（`verified`、`unsigned`、`unknown_key`、`invalid` 等）。
+- [x] V0.2 preview：分支清单、分页提交历史、GitHub 验证状态分类、仓库内 SHA 去重和审计报告。
+- [ ] V0.2 stable：在 Windows PowerShell 5.1/7 上验证多页仓库和典型签名状态。
 - [ ] V0.3：提交图分析和改写计划，包括下游子提交。
 - [ ] V0.4：重建已签名提交，保留 Merge Commit 的父提交顺序和拓扑。
 - [ ] V0.5：本地 bundle 备份、恢复元数据和 Dry Run 审查。
 - [ ] V0.6：逐分支人工确认推送，并检查精确的远程 SHA（lease）。
 - [ ] V0.7：推送后通过 GitHub API 验证，并生成审计报告。
 
-## 后续版本需要处理的特殊情况
+## 当前限制
 
-重写提交会改变 SHA；父提交 SHA 发生变化的后代提交也必须重新生成并签名，即使它们原本已经 Verified。Merge Commit 必须保留完整且有序的父提交列表和 Tree。不能把其他人的提交悄悄重建成当前用户的提交。受保护分支、开放 PR、Annotated Tag、特殊提交头和远程更新也都需要单独的安全处理。V0.1 尚不处理这些情况。
+- V0.2 只审计普通分支引用，不扫描 Tag、PR 引用或其他 Git 引用。
+- 程序读取每个分支可达的完整提交历史。同一仓库内的共享提交会去重，但每个分支仍会分别请求历史；分支较多、历史较长的仓库可能耗时较长并消耗 GitHub API 配额。
+- API 权限错误、仓库被删除或触发限流，都可能导致报告不完整。必须检查错误报告。
+- 验证状态来自 GitHub API，不等同于使用本地 SSH allowed-signers 文件重新进行密码学验证。
+- V0.2 只做审计，不执行签名或历史重写。
 
 ## 许可证
 
