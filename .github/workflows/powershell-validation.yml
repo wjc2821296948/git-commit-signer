@@ -1,0 +1,41 @@
+name: PowerShell validation
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+      - feature/v0.2-signature-audit
+
+jobs:
+  parse:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shell:
+          - powershell
+          - pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Parse GCS.ps1
+        shell: ${{ matrix.shell }}
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+              (Join-Path $PWD 'GCS.ps1'),
+              [ref]$tokens,
+              [ref]$parseErrors
+          )
+
+          if ($parseErrors.Count -gt 0) {
+              $parseErrors | Format-List -Force
+              throw "GCS.ps1 contains PowerShell syntax errors."
+          }
+
+          Write-Host "GCS.ps1 parsed successfully."
