@@ -754,6 +754,7 @@ Git Commit Signer (GCS) - V0.2 preview
 
 Usage:
   powershell -NoProfile -ExecutionPolicy Bypass -File .\GCS.ps1 scan
+  powershell -NoProfile -ExecutionPolicy Bypass -File .\GCS.ps1 audit
   powershell -NoProfile -ExecutionPolicy Bypass -File .\GCS.ps1 doctor
 
 Commands:
