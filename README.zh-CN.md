@@ -4,7 +4,7 @@
 
 [English](README.md)
 
-> **开发状态：V0.2 preview。** 当前最新稳定版仍是 [v0.1.0](https://github.com/wjc2821296948/git-commit-signer/releases/tag/v0.1.0)。
+> **开发状态：V0.2.1 preview。** 当前最新稳定版仍是 [v0.1.0](https://github.com/wjc2821296948/git-commit-signer/releases/tag/v0.1.0)。
 >
 > V0.2 增加分支和提交签名审计。程序读取 GitHub 返回的提交验证结果并导出报告。它**不会**重写提交、修改 Git 引用、修改仓库设置，也不会向 GitHub 推送内容。
 
@@ -24,6 +24,10 @@
   - `Unavailable`：API 响应未提供验证信息。
 - 导出分支、提交、错误和统计报告，支持 CSV/JSON。
 - 检测到 GitHub API 限流时提前停止，并将报告标记为不完整。
+- 支持使用 `-Repository owner/name` 只审计指定仓库。
+- 实时显示仓库、分支和 API 分页进度。
+- 为每次 `gh.exe` 请求设置超时，并对临时网络/服务器故障进行有限重试。
+- 按 Ctrl+C 时停止当前请求，并保存已完成仓库/分支的部分结果，明确标记报告不完整。
 
 ## 环境要求
 
@@ -62,7 +66,7 @@
 .\GCS.ps1 scan -ExpectedLogin YOUR_GITHUB_LOGIN
 ```
 
-### 提交签名审计（V0.2 preview）
+### 提交签名审计（V0.2.1 preview）
 
 扫描所有可访问仓库、它们的分支，以及各分支可达的提交：
 
@@ -71,6 +75,20 @@
 ```
 
 该命令只执行 GitHub 读取请求，不会克隆仓库，也不会读取本机 Git 历史。
+
+只审计一个仓库（建议先用这个方式测试）：
+
+```powershell
+.\GCS.ps1 audit -ExpectedLogin YOUR_GITHUB_LOGIN -Repository YOUR_GITHUB_LOGIN/REPOSITORY
+```
+
+调整请求超时和重试次数：
+
+```powershell
+.\GCS.ps1 audit -ExpectedLogin YOUR_GITHUB_LOGIN -RequestTimeoutSeconds 45 -MaxRetries 2
+```
+
+`-Repository` 仍会先读取账号可访问的仓库清单以确认权限，但只会读取所选仓库的分支和提交历史。
 
 自定义报告目录：
 
@@ -106,7 +124,9 @@ V0.2 签名审计文件：
 - `audit-errors.csv`：仓库/分支读取失败及扫描不完整原因。
 - `audit-summary.json`：统计数量和 `Complete` 完整性标记。
 
-只有在没有仓库或分支扫描错误时，报告才会标记为完整。如果检测到 GitHub API 限流，程序会停止继续请求；请检查 `audit-errors.csv`，待限流解除后重新运行。**不完整报告不能作为全账号扫描结果使用。**
+只有在没有仓库或分支扫描错误且扫描未被中断时，报告才会标记为完整。程序逐页请求 API，并显示当前页进度。每次 `gh.exe` 请求默认超时为 45 秒；临时网络/服务器故障最多重试 2 次，限流和权限错误不会重试。
+
+按 Ctrl+C 时，GCS 会停止当前 `gh.exe` 请求，保存此前已完成的仓库和分支结果，并在 `audit-errors.csv` 记录中断原因；`audit-summary.json` 中 `Cancelled=true`、`Complete=false`。检测到限流时也会停止继续请求。**不完整报告不能作为全账号扫描结果使用。**
 
 相同 Commit SHA 只在同一个仓库内去重。如果同一提交同时出现在 Fork 或另一个仓库中，会分别记录，因为 GitHub 的验证结果是在对应仓库上下文中读取的。
 
@@ -123,6 +143,7 @@ V0.2 签名审计文件：
 
 - [x] V0.1：账号认证检查、分页获取仓库、所有权/可见性分类、JSON/CSV 报告。
 - [x] V0.2 preview：分支清单、分页提交历史、GitHub 验证状态分类、仓库内 SHA 去重和审计报告。
+- [x] V0.2.1 preview：单仓库筛选、逐页进度、单次请求超时、临时故障有限重试和可中断的部分报告（仍待运行环境验收）。
 - [ ] V0.2 stable：在 Windows PowerShell 5.1/7 上验证多页仓库和典型签名状态。
 - [ ] V0.3：提交图分析和改写计划，包括下游子提交。
 - [ ] V0.4：重建已签名提交，保留 Merge Commit 的父提交顺序和拓扑。
@@ -133,7 +154,7 @@ V0.2 签名审计文件：
 ## 当前限制
 
 - V0.2 只审计普通分支引用，不扫描 Tag、PR 引用或其他 Git 引用。
-- 程序读取每个分支可达的完整提交历史。同一仓库内的共享提交会去重，但每个分支仍会分别请求历史；分支较多、历史较长的仓库可能耗时较长并消耗 GitHub API 配额。
+- 程序读取每个分支可达的完整提交历史。同一仓库内的共享提交会去重，但每个分支仍会分别请求历史；分支较多、历史较长的仓库可能耗时较长并消耗 GitHub API 配额。建议先用 `-Repository owner/name` 单独测试一个仓库。
 - API 权限错误、仓库被删除或触发限流，都可能导致报告不完整。必须检查错误报告。
 - 验证状态来自 GitHub API，不等同于使用本地 SSH allowed-signers 文件重新进行密码学验证。
 - V0.2 只做审计，不执行签名或历史重写。
