@@ -82,6 +82,10 @@ function Invoke-Gh {
             $argumentLine = (@($Arguments | ForEach-Object { '"' + ([string]$_).Replace('"', '\"') + '"' }) -join ' ')
             $process = Start-Process -FilePath $script:GhPath -ArgumentList $argumentLine -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath -ErrorAction Stop
 
+            # Cache the process handle before waiting. Windows PowerShell 5.1 can otherwise
+            # return $null for ExitCode when Start-Process uses -NoNewWindow with redirected streams.
+            $null = $process.Handle
+
             $timer = [System.Diagnostics.Stopwatch]::StartNew()
             while (-not $process.WaitForExit(250)) {
                 if ($null -ne $script:AuditCancelState -and $script:AuditCancelState.Requested) {
