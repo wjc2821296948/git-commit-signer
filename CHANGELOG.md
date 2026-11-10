@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+### Fixed
+- Decode paginated repository results one record at a time to avoid large nested JSON parsing failures in Windows PowerShell 5.1.
+
 ## [0.1.0] - 2026-11-09
 
 ### Added
