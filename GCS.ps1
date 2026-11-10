@@ -438,10 +438,10 @@ function Get-RepositoryCommitAudit {
 
 function Write-AuditReports {
     param(
-        [Parameter(Mandatory = $true)][object[]]$Repositories,
-        [Parameter(Mandatory = $true)][object[]]$Branches,
-        [Parameter(Mandatory = $true)][object[]]$Commits,
-        [Parameter(Mandatory = $true)][object[]]$Errors,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Repositories,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Branches,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Commits,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Errors,
         [Parameter(Mandatory = $true)][string]$Login,
         [Parameter(Mandatory = $true)][string]$Directory,
         [Parameter(Mandatory = $true)][int]$RepositoryFailureCount,
