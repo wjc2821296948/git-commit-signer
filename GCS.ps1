@@ -244,6 +244,7 @@ function Get-RepositoryCommitAudit {
     $errorRows = New-Object System.Collections.Generic.List[object]
     $commitRecords = @{}
     $branchFailureCount = 0
+    $rateLimitHit = $false
     $branches = @()
 
     $branchesEndpoint = "/repos/$($Repository.FullName)/branches?per_page=100"
@@ -257,11 +258,13 @@ function Get-RepositoryCommitAudit {
         ) -ExpectedProperty 'name')
     }
     catch {
+        $message = [string]$_.Exception.Message
+        $rateLimitHit = ($message -match '(?i)rate limit|secondary rate|abuse detection')
         $errorRows.Add([pscustomobject]@{
             Repository = $Repository.FullName
             Branch = ''
             Stage = 'ListBranches'
-            Message = ([string]$_.Exception.Message)
+            Message = $message
         })
         return [pscustomobject]@{
             Branches = @()
@@ -270,6 +273,7 @@ function Get-RepositoryCommitAudit {
             BranchCount = 0
             BranchFailureCount = 1
             RepositoryFailed = $true
+            RateLimitHit = $rateLimitHit
         }
     }
 
@@ -372,12 +376,17 @@ function Get-RepositoryCommitAudit {
         catch {
             $branchFailureCount++
             $branchRow.Status = 'Failed'
+            $message = [string]$_.Exception.Message
+            $rateLimitHit = ($message -match '(?i)rate limit|secondary rate|abuse detection')
             $errorRows.Add([pscustomobject]@{
                 Repository = $Repository.FullName
                 Branch = $branchName
                 Stage = 'ListCommits'
-                Message = ([string]$_.Exception.Message)
+                Message = $message
             })
+            if ($rateLimitHit) {
+                break
+            }
         }
     }
 
@@ -412,6 +421,7 @@ function Get-RepositoryCommitAudit {
         BranchCount = $branchRows.Count
         BranchFailureCount = $branchFailureCount
         RepositoryFailed = $false
+        RateLimitHit = $rateLimitHit
     }
 }
 
@@ -550,6 +560,16 @@ function Invoke-Audit {
         }
 
         Write-Host "  branches: $($result.BranchCount); unique commits: $($result.Commits.Count); branch failures: $($result.BranchFailureCount)"
+
+        if ($result.RateLimitHit) {
+            $allErrors.Add([pscustomobject]@{
+                Repository = $repository.FullName
+                Branch = ''
+                Stage = 'ScanStopped'
+                Message = 'GitHub API rate limiting was detected. Remaining repositories were not scanned; rerun the audit after the limit resets.'
+            })
+            break
+        }
     }
 
     $reportParameters = @{
