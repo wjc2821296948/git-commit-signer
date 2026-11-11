@@ -4,9 +4,9 @@
 
 [简体中文](README.zh-CN.md)
 
-> **Development status: V0.2.1 preview.** The latest stable release is still [v0.1.0](https://github.com/wjc2821296948/git-commit-signer/releases/tag/v0.1.0).
+> **Current stable release: [v0.2.1](https://github.com/wjc2821296948/git-commit-signer/releases/tag/v0.2.1).**
 >
-> V0.2 adds branch and commit-signature auditing. It reads GitHub's commit verification result and exports reports. It does **not** rewrite commits, change Git refs, update repository settings, or push anything.
+> V0.2.1 provides a read-only commit-signature audit with repository filtering, page-level progress, per-request timeouts, bounded retries, and Ctrl+C cancellation with partial-report saving. It reads GitHub's commit verification results and exports reports. It does **not** sign commits, rewrite commit history, change Git refs, update repository settings, or push anything.
 
 ## Features
 
@@ -66,7 +66,7 @@ Lists repositories visible to the authenticated account:
 .\GCS.ps1 scan -ExpectedLogin YOUR_GITHUB_LOGIN
 ```
 
-### Commit-signature audit (V0.2.1 preview)
+### Commit-signature audit (V0.2.1 stable)
 
 Audits all accessible repositories, their branches, and the commits reachable from those branches:
 
@@ -134,9 +134,8 @@ The audit deduplicates a commit only within the same repository. The same SHA ap
 ## Roadmap
 
 - [x] V0.1 — authenticated account check, paginated repository discovery, ownership/visibility classification, JSON and CSV reports.
-- [x] V0.2 preview — branch inventory, paginated commit history, GitHub verification classification, per-repository SHA deduplication, and audit reports.
-- [x] V0.2.1 preview — single-repository filtering, page-level progress, per-request timeout, bounded transient retries, and cancellation-aware partial reports (runtime validation pending).
-- [ ] V0.2 stable — Windows PowerShell 5.1/7 runtime validation across multi-page repositories and representative signature reasons.
+- [x] V0.2 — branch inventory, paginated commit history, GitHub verification classification, per-repository SHA deduplication, and audit reports.
+- [x] V0.2.1 stable — single-repository filtering, page-level progress, per-request timeouts, bounded transient retries, and cancellation-aware partial reports; multi-page auditing and Ctrl+C cancellation were runtime-validated under Windows PowerShell 5.1, with parser and startup smoke checks passing in CI for Windows PowerShell 5.1 and PowerShell 7.
 - [ ] V0.3 — commit-graph analysis and rewrite planning, including downstream descendants.
 - [ ] V0.4 — signed commit reconstruction with merge-parent order and topology preservation.
 - [ ] V0.5 — local bundle backups, recovery metadata, and dry-run review.
@@ -145,11 +144,11 @@ The audit deduplicates a commit only within the same repository. The same SHA ap
 
 ## Known limitations
 
-- V0.2 audits ordinary branch refs only. Tags, pull-request refs, and other Git refs are not scanned.
+- The audit currently covers ordinary branch refs only. Tags, pull-request refs, and other Git refs are not scanned.
 - It reads the commit history reachable from each branch. Shared commits are deduplicated within a repository, but each branch history is requested separately; large repositories with many branches may take time and consume GitHub API quota. Use `-Repository owner/name` to test or audit one repository first.
 - A GitHub API permission error, repository removal, or rate limit can make the report incomplete. The error report must be checked.
 - Verification is GitHub's reported status, not a local cryptographic re-verification using an SSH allowed-signers file.
-- V0.2 is audit-only. It does not perform any signing or history rewriting.
+- GCS v0.2.1 is audit-only. It does not perform commit signing or history rewriting.
 
 ## License
 
