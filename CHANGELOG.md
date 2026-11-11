@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.2.1] - 2026-11-11
 
 ### Added
 - Add a read-only V0.2 audit command that inventories repository branches and all reachable commits.
